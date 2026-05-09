@@ -1,0 +1,18 @@
+import 'menu_item.dart';
+
+/// An item in the waiter's current order cart.
+class CartItem {
+  final MenuItem menuItem;
+  int quantity;
+  final String? status; // e.g. 'pending', 'preparing', 'served'
+  final String? oiId; // order_item id when editing existing orders
+
+  CartItem({
+    required this.menuItem,
+    this.quantity = 1,
+    this.status,
+    this.oiId,
+  });
+
+  double get lineTotal => menuItem.price * quantity;
+}
