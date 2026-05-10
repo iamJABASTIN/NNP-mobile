@@ -4,6 +4,9 @@ import '../models/order.dart';
 import '../services/order_service.dart';
 import '../widgets/brutal_card.dart';
 import '../widgets/brutal_button.dart';
+import '../services/offline/database_service.dart';
+import '../models/cart_item.dart';
+import 'dart:convert';
 
 /// Order List screen — mirrors OrderList.jsx with expandable detail view.
 class OrderListScreen extends StatefulWidget {
@@ -28,18 +31,65 @@ class _OrderListScreenState extends State<OrderListScreen> {
 
   Future<void> _fetchOrders() async {
     setState(() => _loading = true);
+    List<Order> cloudOrders = [];
+    List<Order> pendingOrders = [];
+
+    // 1. Fetch from local pending queue (Always works offline)
+    try {
+      final pendingData = await DatabaseService.getPendingOrders();
+      pendingOrders = pendingData.map((data) {
+        try {
+          final cartList = jsonDecode(data['cart_json']) as List;
+          final items = cartList.map((i) {
+            final cartItem = CartItem.fromJson(i as Map<String, dynamic>);
+            return OrderItemDetail(
+              id: 'local_${data['id']}',
+              menuItemId: cartItem.menuItem.id,
+              name: cartItem.menuItem.name,
+              quantity: cartItem.quantity,
+              unitPrice: cartItem.menuItem.price,
+              vegType: cartItem.menuItem.vegType,
+            );
+          }).toList();
+
+          return Order(
+            id: 'local_${data['id']}',
+            totalAmount: (data['total_amount'] as num).toDouble(),
+            status: 'PENDING SYNC',
+            customerName: data['customer_name'] as String?,
+            customerPhone: data['customer_phone'] as String?,
+            placedAt: DateTime.tryParse(data['created_at'] as String),
+            items: items,
+            tableId: data['table_id'] as String?,
+            tableNumber: null,
+          );
+        } catch (e) {
+          print('Error mapping local order ${data['id']}: $e');
+          return null;
+        }
+      }).whereType<Order>().toList();
+    } catch (e) {
+      print('Failed to load local pending orders: $e');
+    }
+
+    // 2. Try to fetch from cloud (Today's orders)
     try {
       final now = DateTime.now();
       final since = DateTime(now.year, now.month, now.day);
-      _orders = await OrderService.fetchOrders(since: since);
+      cloudOrders = await OrderService.fetchOrders(since: since)
+          .timeout(const Duration(seconds: 5));
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Failed: $e')));
-      }
+      print('Cloud fetch failed (offline?): $e');
+      // We don't show a snackbar here because we want to stay "silent" 
+      // if we are just offline and have local data to show.
     }
-    if (mounted) setState(() => _loading = false);
+
+    if (mounted) {
+      setState(() {
+        _orders = [...pendingOrders, ...cloudOrders];
+        _loading = false;
+      });
+    }
   }
 
   String _formatTime(DateTime? dt) {
@@ -243,6 +293,16 @@ class _OrderCard extends StatelessWidget {
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
+                      if (order.status == 'PENDING SYNC')
+                        Container(
+                          margin: const EdgeInsets.only(right: 8),
+                          padding: const EdgeInsets.all(4),
+                          decoration: const BoxDecoration(
+                            color: AppColors.primaryYellow,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(Icons.sync, size: 12, color: AppColors.black),
+                        ),
                       Text(
                         '₹${order.totalAmount.toStringAsFixed(0)}',
                         style: BrutalText.price,

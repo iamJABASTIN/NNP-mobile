@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
+import 'package:flutter_native_splash/flutter_native_splash.dart';
 import '../core/app_theme.dart';
+import '../services/menu_service.dart';
+import '../services/offline/database_service.dart';
 
 class SplashScreen extends StatefulWidget {
   final VoidCallback onComplete;
@@ -20,6 +23,11 @@ class _SplashScreenState extends State<SplashScreen>
   @override
   void initState() {
     super.initState();
+    // Remove the native splash screen now that we are ready to show our custom one
+    FlutterNativeSplash.remove();
+
+    _syncData();
+
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1500),
@@ -38,11 +46,29 @@ class _SplashScreenState extends State<SplashScreen>
     );
 
     _controller.forward();
+  }
 
-    // After animation and a small delay, call onComplete
-    Future.delayed(const Duration(milliseconds: 2500), () {
-      if (mounted) widget.onComplete();
-    });
+  Future<void> _syncData() async {
+    try {
+      // Fetch latest data from Supabase
+      final items = await MenuService.fetchAvailableItems();
+      final tables = await MenuService.fetchTables();
+
+      // Save to local cache
+      await DatabaseService.saveMenuItems(items);
+      await DatabaseService.saveTables(tables);
+      
+      print('Splash: Local cache updated successfully');
+    } catch (e) {
+      print('Splash: Sync failed (using existing cache): $e');
+    } finally {
+      // Ensure splash finishes even if sync fails
+      if (mounted) {
+        Future.delayed(const Duration(milliseconds: 2000), () {
+          if (mounted) widget.onComplete();
+        });
+      }
+    }
   }
 
   @override

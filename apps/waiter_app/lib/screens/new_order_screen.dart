@@ -6,7 +6,10 @@ import '../models/table_info.dart';
 import '../services/menu_service.dart';
 import '../services/order_service.dart';
 import '../models/order.dart';
+import '../services/offline/database_service.dart';
+import '../services/offline/offline_sync_service.dart';
 import 'new_order_widgets.dart';
+import 'dart:convert';
 
 /// POS screen for creating / editing orders — search focused.
 class NewOrderScreen extends StatefulWidget {
@@ -67,49 +70,80 @@ class _NewOrderScreenState extends State<NewOrderScreen> {
 
   Future<void> _fetchData() async {
     setState(() => _loading = true);
+    bool hasLocalData = false;
+
     try {
+      // 1. Load from local cache first (Instant)
+      final localItems = await DatabaseService.getMenuItems();
+      final localTables = await DatabaseService.getTables();
+
+      if (localItems.isNotEmpty) {
+        setState(() {
+          _menuItems = localItems;
+          _tables = localTables;
+          _loading = false; // Stop showing the main loader early
+        });
+        hasLocalData = true;
+      }
+    } catch (e) {
+      print('Error loading local cache: $e');
+    }
+
+    try {
+      // 2. Try to refresh from network
       final results = await Future.wait([
         MenuService.fetchAvailableItems(),
         MenuService.fetchTables(),
         if (widget.editingOrderId != null)
           OrderService.fetchOrderById(widget.editingOrderId!),
-      ]);
+      ]).timeout(const Duration(seconds: 4));
 
-      setState(() {
-        _menuItems = results[0] as List<MenuItem>;
-        _tables = results[1] as List<TableInfo>;
-
-        if (widget.editingOrderId != null && results.length > 2) {
-          final order = results[2] as Order;
-          _cart.clear();
-          for (final item in order.items) {
-            _cart.add(CartItem(
-              menuItem: MenuItem(
-                id: item.menuItemId,
-                name: item.name,
-                price: item.unitPrice,
-                vegType: item.vegType,
-                isAvailable: true,
-              ),
-              quantity: item.quantity,
-              status: item.status,
-            ));
-          }
-          _nameCtrl.text = order.customerName ?? '';
-          _phoneCtrl.text = order.customerPhone ?? '';
-          _selectedTableId = order.tableId;
-          _orderType = order.tableId != null ? 'dine-in' : 'takeaway';
-        }
-
-        _loading = false;
-      });
-    } catch (e) {
-      setState(() => _loading = false);
       if (mounted) {
+        setState(() {
+          _menuItems = results[0] as List<MenuItem>;
+          _tables = results[1] as List<TableInfo>;
+
+          // Update local cache with fresh data for next time
+          DatabaseService.saveMenuItems(_menuItems);
+          DatabaseService.saveTables(_tables);
+
+          if (widget.editingOrderId != null && results.length > 2) {
+            final order = results[2] as Order;
+            _cart.clear();
+            for (final item in order.items) {
+              _cart.add(CartItem(
+                menuItem: MenuItem(
+                  id: item.menuItemId,
+                  name: item.name,
+                  price: item.unitPrice,
+                  vegType: item.vegType,
+                  isAvailable: true,
+                ),
+                quantity: item.quantity,
+                status: item.status,
+              ));
+            }
+            _nameCtrl.text = order.customerName ?? '';
+            _phoneCtrl.text = order.customerPhone ?? '';
+            _selectedTableId = order.tableId;
+            _orderType = order.tableId != null ? 'dine-in' : 'takeaway';
+          }
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      print('Network fetch failed: $e');
+      // ONLY show the error snackbar if we have NO local data to show
+      if (!hasLocalData && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to load: $e')),
+          SnackBar(
+            content: Text('Offline: Using local menu ($e)'),
+            behavior: SnackBarBehavior.floating,
+          ),
         );
       }
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -137,42 +171,53 @@ class _NewOrderScreenState extends State<NewOrderScreen> {
 
   Future<void> _submit() async {
     if (_cart.isEmpty) return;
-    
-    // Note: Validation (table selection) is now handled in the modal 
-    // to ensure the loading state resets properly.
 
-    setState(() => _isSubmitting = true);
+    setState(() {
+      _isSubmitting = true;
+      _success = false;
+    });
+
     try {
       if (widget.editingOrderId != null) {
+        // 1. Editing existing order (Online required for edits)
         await OrderService.updateOrder(
           orderId: widget.editingOrderId!,
-          cart: _cart, orderType: _orderType,
+          cart: _cart,
+          orderType: _orderType,
           tableId: _selectedTableId,
-          customerName: _nameCtrl.text, customerPhone: _phoneCtrl.text,
+          customerName: _nameCtrl.text,
+          customerPhone: _phoneCtrl.text,
         );
       } else {
-        await OrderService.createOrder(
-          cart: _cart, orderType: _orderType,
-          tableId: _selectedTableId,
-          customerName: _nameCtrl.text, customerPhone: _phoneCtrl.text,
+        // 2. New Order (Offline-First Queueing)
+        final String encodedCart = jsonEncode(
+          _cart.map((item) => item.toJson()).toList(),
         );
+
+        await DatabaseService.queueOrder(
+          tableId: _selectedTableId,
+          orderType: _orderType,
+          customerName: _nameCtrl.text.isEmpty ? 'Guest' : _nameCtrl.text,
+          customerPhone: _phoneCtrl.text,
+          cartJson: encodedCart,
+          totalAmount: _total,
+        );
+
+        // Try to sync in background immediately
+        OfflineSyncService().syncPendingOrders();
       }
+
+      // 3. Success Handling
+      _success = true;
+      
       if (mounted) {
-        // 1. Close modal immediately to avoid "stuck" UI
-        Navigator.of(context, rootNavigator: true).pop();
-        
-        // 2. Clear state
+        // Clear all fields for next order
         setState(() {
           _cart.clear();
           _nameCtrl.clear();
           _phoneCtrl.clear();
           _selectedTableId = null;
-          _isSubmitting = false;
-        });
-
-        // 3. Switch tab smoothly
-        Future.delayed(const Duration(milliseconds: 100), () {
-          widget.onOrderComplete?.call();
+          _isCartExpanded = false;
         });
 
         ScaffoldMessenger.of(context).showSnackBar(
@@ -180,10 +225,17 @@ class _NewOrderScreenState extends State<NewOrderScreen> {
             content: Text('ORDER PLACED SUCCESSFULLY!'),
             behavior: SnackBarBehavior.floating,
             backgroundColor: Colors.green,
+            duration: Duration(seconds: 2),
           ),
         );
+
+        // Smoothly notify parent to switch tabs or refresh
+        Future.delayed(const Duration(milliseconds: 200), () {
+          if (mounted) widget.onOrderComplete?.call();
+        });
       }
     } catch (e) {
+      print('Submission error: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(

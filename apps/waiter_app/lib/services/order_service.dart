@@ -148,64 +148,79 @@ class OrderService {
     String? customerName,
     String? customerPhone,
   }) async {
-    final totalAmount =
-        cart.fold<double>(0, (sum, item) => sum + item.lineTotal);
-    final timestamp = DateTime.now().toUtc().toIso8601String();
+    try {
+      final totalAmount =
+          cart.fold<double>(0, (sum, item) => sum + item.lineTotal);
+      final timestamp = DateTime.now().toUtc().toIso8601String();
 
-    // Handle session
-    String? sessionId;
-    String? effectiveTableId = tableId;
+      print('OrderService: Updating order $orderId...');
 
-    if (orderType == 'takeaway') {
-      final takeoutTable = await SupabaseConfig.client
-          .from('tables')
-          .select('id')
-          .ilike('table_number', 'Takeout%')
-          .maybeSingle();
-      if (takeoutTable != null) {
-        effectiveTableId = takeoutTable['id'] as String;
+      // Handle session
+      String? sessionId;
+      String? effectiveTableId = tableId;
+
+      if (orderType == 'takeaway') {
+        final takeoutTable = await SupabaseConfig.client
+            .from('tables')
+            .select('id')
+            .ilike('table_number', 'Takeout%')
+            .maybeSingle();
+        if (takeoutTable != null) {
+          effectiveTableId = takeoutTable['id'] as String;
+        }
       }
+
+      if (effectiveTableId != null) {
+        try {
+          final activeSession = await SupabaseConfig.client
+              .from('table_sessions')
+              .select('id')
+              .eq('table_id', effectiveTableId)
+              .eq('status', 'active')
+              .maybeSingle();
+
+          sessionId = activeSession?['id'] as String?;
+        } catch (sessionErr) {
+          print('OrderService: Session lookup failed (ignoring): $sessionErr');
+        }
+      }
+
+      // 1. Update the order record
+      await SupabaseConfig.client
+          .from('orders')
+          .update({
+            'total_amount': totalAmount,
+            'table_id': effectiveTableId,
+            'session_id': sessionId,
+            'special_instructions':
+                'Waiter POS Order: ${customerName ?? "Guest"} [Edited]',
+            'last_activity_at': timestamp,
+          })
+          .eq('id', orderId);
+
+      // 2. Delete old items
+      await SupabaseConfig.client
+          .from('order_items')
+          .delete()
+          .eq('order_id', orderId);
+
+      // 3. Re-insert new items
+      final orderItems = cart.map((item) => {
+        'order_id': orderId,
+        'menu_item_id': item.menuItem.id,
+        'quantity': item.quantity,
+        'unit_price': item.menuItem.price,
+        'status': item.status ?? 'pending',
+        'station': 'Main Kitchen',
+      }).toList();
+
+      await SupabaseConfig.client.from('order_items').insert(orderItems);
+      
+      print('OrderService: Order $orderId updated successfully.');
+    } catch (e, stack) {
+      print('OrderService ERROR: Update failed for $orderId: $e');
+      print('OrderService STACK: $stack');
+      rethrow;
     }
-
-    if (effectiveTableId != null) {
-      final activeSession = await SupabaseConfig.client
-          .from('table_sessions')
-          .select('id')
-          .eq('table_id', effectiveTableId)
-          .eq('status', 'active')
-          .maybeSingle();
-
-      sessionId = activeSession?['id'] as String?;
-    }
-
-    // Update the order record
-    await SupabaseConfig.client
-        .from('orders')
-        .update({
-          'total_amount': totalAmount,
-          'table_id': effectiveTableId,
-          'session_id': sessionId,
-          'special_instructions':
-              'Waiter POS Order: ${customerName ?? "Guest"} [Edited]',
-          'last_activity_at': timestamp,
-        })
-        .eq('id', orderId);
-
-    // Delete old items and re-insert
-    await SupabaseConfig.client
-        .from('order_items')
-        .delete()
-        .eq('order_id', orderId);
-
-    final orderItems = cart.map((item) => {
-      'order_id': orderId,
-      'menu_item_id': item.menuItem.id,
-      'quantity': item.quantity,
-      'unit_price': item.menuItem.price,
-      'status': item.status ?? 'pending',
-      'station': 'Main Kitchen',
-    }).toList();
-
-    await SupabaseConfig.client.from('order_items').insert(orderItems);
   }
 }
